@@ -1,13 +1,30 @@
 services:
 
   app:
+    build:
+      context: .
+      dockerfile: Dockerfile
     image: workshop-organizer
     ports:
       - "8080:8080"
     environment:
+      # DB connection — points at the "db" service on the compose network,
+      # overriding the localhost values from application.properties.
       SPRING_DATASOURCE_URL: "jdbc:postgresql://db:5432/workshopsdb"
       SPRING_DATASOURCE_USERNAME: workshops_user
       SPRING_DATASOURCE_PASSWORD: oc2024
+    depends_on:
+      db:
+        # Don't start the app until Postgres reports healthy.
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/actuator/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      # Give Spring Boot time to boot before health checks start counting.
+      start_period: 60s
+    restart: unless-stopped
 
   db:
     image: postgres:13
@@ -15,3 +32,16 @@ services:
       POSTGRES_USER: workshops_user
       POSTGRES_PASSWORD: oc2024
       POSTGRES_DB: workshopsdb
+    volumes:
+      # Named volume so data survives container restarts / recreation.
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U workshops_user -d workshopsdb"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    restart: unless-stopped
+
+volumes:
+  postgres_data:

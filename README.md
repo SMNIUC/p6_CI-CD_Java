@@ -42,10 +42,23 @@ To compile and run the application locally, follow these steps:
    ```
    For production, package the application as WAR and use a tomcat server
 
-To run correctly the application with docker after you building it with tag workshop-organizer, run the following
+To run the full stack (application + PostgreSQL) with Docker, simply run the
+following from the project root. Compose will build the application image,
+start PostgreSQL with a persistent volume, wait until the database is healthy,
+then start the app:
 
 ```bash
 docker compose up -d
+```
+
+Once both containers report `healthy`, the API is available at
+`http://localhost:8080` (e.g. `http://localhost:8080/api/notions`), and the
+container health endpoint is `http://localhost:8080/actuator/health`.
+
+To stop everything (the database volume is preserved):
+
+```bash
+docker compose down
 ```
 
 ## Configuration

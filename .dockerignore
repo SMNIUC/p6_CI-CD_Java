@@ -1,0 +1,19 @@
+# Build output & caches
+build/
+.gradle/
+
+# VCS & IDE
+.git/
+.gitignore
+.idea/
+*.iml
+
+# OpenAPI generated sources (regenerated during the build)
+src/main/java-generated/
+.openapi-generator/
+
+# Docs / infra not needed inside the build context
+README.md
+HELP.md
+k8s/
+values.tpl.yaml
