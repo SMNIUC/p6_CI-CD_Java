@@ -40,6 +40,10 @@ jobs:
     # runner (e.g. headless Chrome) hangs and stops responding.
     timeout-minutes: 15
 
+    # Expose the detected project type so the build job can adapt validation to it.
+    outputs:
+      project_type: ${{ steps.detect.outputs.type }}
+
     steps:
       - name: Checkout
         uses: actions/checkout@v6
@@ -147,51 +151,19 @@ jobs:
       contents: read
       packages: write
 
-    # Ephemeral dependencies used ONLY to validate the image before pushing.
-    # Credentials here are throwaway CI values, not secrets.
-    # Remove this whole block for images that need no backing services (e.g. the Angular app).
-    services:
-      postgres:
-        image: postgres:16-alpine
-        env:
-          POSTGRES_USER: app
-          POSTGRES_PASSWORD: app
-          POSTGRES_DB: app
-        ports:
-          - 5432:5432
-        # Hold the job until Postgres is ready to accept connections.
-        options: >-
-          --health-cmd "pg_isready -U app"
-          --health-interval 10s
-          --health-timeout 5s
-          --health-retries 5
-
     env:
       REGISTRY: ghcr.io
       # Image repository — defaults to this repo (owner/name). Override to retarget.
       IMAGE_NAME: ${{ github.repository }}
-      # --- Validation config (adapt per project type) ---
-      # Mode: 'http'   -> probe an HTTP endpoint for EXPECTED_STATUS
-      #       'running'-> just check the container stays up (good for non-HTTP apps/services)
-      #       'none'   -> skip validation entirely
+      # --- Generic validation knobs (per-language specifics are resolved below) ---
+      # Mode: 'http'    -> probe an HTTP endpoint for EXPECTED_STATUS
+      #       'running' -> just check the container stays up (good for non-HTTP apps/services)
+      #       'none'    -> skip validation entirely
       VALIDATE: http
-      CONTAINER_PORT: '8080'    # port the app listens on INSIDE the container (Spring Boot embedded Tomcat)
-      HEALTH_PATH: '/actuator/health'  # Spring Boot actuator health endpoint (returns 200 when UP)
-      EXPECTED_STATUS: '200'    # expected HTTP status code
-      TEST_PORT: '8080'         # host port mapped to CONTAINER_PORT during validation (unused in host network mode)
-      # Networking for the validated container:
-      #   'bridge' -> isolated (default, fine for self-contained images like the Angular app)
-      #   'host'   -> shares the runner network so it can reach service containers (DB, etc.) on localhost
-      VALIDATE_NETWORK: host
-      # Extra env vars injected into the validated container, one KEY=VALUE per line.
-      # This app needs PostgreSQL at startup (JPA + ddl-auto=update), so point it at the
-      # `postgres` service container above (reachable on localhost via host networking).
-      # The service's user/password/db are all "app". These are throwaway CI values —
-      # use ${{ secrets.* }} for anything sensitive.
-      VALIDATE_RUN_ENV: |
-        SPRING_DATASOURCE_URL=jdbc:postgresql://localhost:5432/app
-        SPRING_DATASOURCE_USERNAME=app
-        SPRING_DATASOURCE_PASSWORD=app
+      EXPECTED_STATUS: '200'        # expected HTTP status code
+      TEST_PORT: '8080'             # host port mapped to the app's port during validation
+      STARTUP_TIMEOUT: '120'        # seconds to wait for the app to become healthy
+      DB_IMAGE: postgres:16-alpine  # ephemeral DB started only for DB-backed (java) images
 
     steps:
       - name: Checkout
@@ -223,45 +195,91 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
+      # Pick the validation settings that match the project type the test job detected,
+      # so this one file works for both the Angular and the Java image.
+      - name: Resolve validation settings
+        if: env.VALIDATE != 'none'
+        run: |
+          set -euo pipefail
+          type="${{ needs.test.outputs.project_type }}"
+          echo "Project type: $type"
+          case "$type" in
+            node)
+              # Angular served by nginx: HTTP on port 80, no backing services.
+              echo "CONTAINER_PORT=80" >> "$GITHUB_ENV"
+              echo "HEALTH_PATH=/" >> "$GITHUB_ENV"
+              echo "NEEDS_DB=false" >> "$GITHUB_ENV"
+              ;;
+            java)
+              # Spring Boot: HTTP on 8080, actuator health, needs a PostgreSQL at startup.
+              echo "CONTAINER_PORT=8080" >> "$GITHUB_ENV"
+              echo "HEALTH_PATH=/actuator/health" >> "$GITHUB_ENV"
+              echo "NEEDS_DB=true" >> "$GITHUB_ENV"
+              ;;
+            *)
+              echo "::error::Cannot resolve validation settings for project type '$type'."
+              exit 1
+              ;;
+          esac
+
       - name: Validate image is functional
         if: env.VALIDATE != 'none'
         run: |
           set -euo pipefail
 
-          cleanup() { docker logs ci-validate 2>&1 || true; docker rm -f ci-validate >/dev/null 2>&1 || true; }
+          network=ci-validate-net
+          cleanup() {
+            docker logs ci-validate 2>&1 || true
+            docker rm -f ci-validate ci-postgres >/dev/null 2>&1 || true
+            docker network rm "$network" >/dev/null 2>&1 || true
+          }
           trap cleanup EXIT
 
-          # Assemble docker run args based on the configured network mode.
-          run_args=(-d --name ci-validate)
-          if [ "$VALIDATE_NETWORK" = "host" ]; then
-            # Share the runner network so the app can reach service containers on localhost.
-            run_args+=(--network host)
-            base_url="http://localhost:${CONTAINER_PORT}"
-          else
-            run_args+=(-p "${TEST_PORT}:${CONTAINER_PORT}")
-            base_url="http://localhost:${TEST_PORT}"
+          # Isolated network so the app container can reach the DB by name (when needed).
+          docker network create "$network" >/dev/null
+
+          app_env=()
+          if [ "${NEEDS_DB}" = "true" ]; then
+            echo "Starting ephemeral PostgreSQL for validation..."
+            docker run -d --name ci-postgres --network "$network" \
+              -e POSTGRES_USER=app -e POSTGRES_PASSWORD=app -e POSTGRES_DB=app \
+              "${DB_IMAGE}" >/dev/null
+            for i in $(seq 1 30); do
+              if docker exec ci-postgres pg_isready -U app >/dev/null 2>&1; then
+                echo "PostgreSQL is ready."
+                break
+              fi
+              sleep 2
+            done
+            # Throwaway CI credentials; the app reaches the DB by container name on the shared network.
+            app_env+=(-e "SPRING_DATASOURCE_URL=jdbc:postgresql://ci-postgres:5432/app")
+            app_env+=(-e "SPRING_DATASOURCE_USERNAME=app")
+            app_env+=(-e "SPRING_DATASOURCE_PASSWORD=app")
           fi
 
-          # Inject any extra env vars (one KEY=VALUE per line).
-          while IFS= read -r line; do
-            [ -z "${line// }" ] && continue
-            run_args+=(-e "$line")
-          done <<< "${VALIDATE_RUN_ENV}"
-
-          docker run "${run_args[@]}" "${{ steps.meta.outputs.ref }}"
+          docker run -d --name ci-validate --network "$network" \
+            -p "${TEST_PORT}:${CONTAINER_PORT}" "${app_env[@]}" \
+            "${{ steps.meta.outputs.ref }}"
+          base_url="http://localhost:${TEST_PORT}"
 
           case "$VALIDATE" in
             http)
               ok=0
-              for i in $(seq 1 15); do
+              deadline=$(( SECONDS + STARTUP_TIMEOUT ))
+              while [ "$SECONDS" -lt "$deadline" ]; do
+                # Fail fast on a boot crash instead of waiting out the whole timeout.
+                if [ "$(docker inspect -f '{{.State.Running}}' ci-validate 2>/dev/null)" != "true" ]; then
+                  echo "::error::Container exited before becoming healthy (boot failure)."
+                  break
+                fi
                 code="$(curl -s -o /dev/null -w '%{http_code}' "${base_url}${HEALTH_PATH}" || true)"
                 if [ "$code" = "$EXPECTED_STATUS" ]; then
                   echo "App responded with HTTP $code (expected $EXPECTED_STATUS)."
                   ok=1
                   break
                 fi
-                echo "Attempt $i: got '$code', want '$EXPECTED_STATUS', retrying in 2s..."
-                sleep 2
+                echo "Waiting for app... got '$code', want '$EXPECTED_STATUS' (${SECONDS}s/${STARTUP_TIMEOUT}s)"
+                sleep 3
               done
               ;;
             running)
