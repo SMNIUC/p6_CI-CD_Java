@@ -147,6 +147,25 @@ jobs:
       contents: read
       packages: write
 
+    # Ephemeral dependencies used ONLY to validate the image before pushing.
+    # Credentials here are throwaway CI values, not secrets.
+    # Remove this whole block for images that need no backing services (e.g. the Angular app).
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: app
+          POSTGRES_PASSWORD: app
+          POSTGRES_DB: app
+        ports:
+          - 5432:5432
+        # Hold the job until Postgres is ready to accept connections.
+        options: >-
+          --health-cmd "pg_isready -U app"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
     env:
       REGISTRY: ghcr.io
       # Image repository — defaults to this repo (owner/name). Override to retarget.
@@ -156,10 +175,23 @@ jobs:
       #       'running'-> just check the container stays up (good for non-HTTP apps/services)
       #       'none'   -> skip validation entirely
       VALIDATE: http
-      CONTAINER_PORT: '80'      # port the app listens on INSIDE the container (e.g. 8080 for Spring Boot)
-      HEALTH_PATH: '/'          # HTTP path to probe (e.g. /actuator/health)
+      CONTAINER_PORT: '8080'    # port the app listens on INSIDE the container (Spring Boot embedded Tomcat)
+      HEALTH_PATH: '/actuator/health'  # Spring Boot actuator health endpoint (returns 200 when UP)
       EXPECTED_STATUS: '200'    # expected HTTP status code
-      TEST_PORT: '8080'         # host port mapped to CONTAINER_PORT during validation
+      TEST_PORT: '8080'         # host port mapped to CONTAINER_PORT during validation (unused in host network mode)
+      # Networking for the validated container:
+      #   'bridge' -> isolated (default, fine for self-contained images like the Angular app)
+      #   'host'   -> shares the runner network so it can reach service containers (DB, etc.) on localhost
+      VALIDATE_NETWORK: host
+      # Extra env vars injected into the validated container, one KEY=VALUE per line.
+      # This app needs PostgreSQL at startup (JPA + ddl-auto=update), so point it at the
+      # `postgres` service container above (reachable on localhost via host networking).
+      # The service's user/password/db are all "app". These are throwaway CI values —
+      # use ${{ secrets.* }} for anything sensitive.
+      VALIDATE_RUN_ENV: |
+        SPRING_DATASOURCE_URL=jdbc:postgresql://localhost:5432/app
+        SPRING_DATASOURCE_USERNAME=app
+        SPRING_DATASOURCE_PASSWORD=app
 
     steps:
       - name: Checkout
@@ -199,13 +231,30 @@ jobs:
           cleanup() { docker logs ci-validate 2>&1 || true; docker rm -f ci-validate >/dev/null 2>&1 || true; }
           trap cleanup EXIT
 
-          docker run -d --name ci-validate -p "${TEST_PORT}:${CONTAINER_PORT}" "${{ steps.meta.outputs.ref }}"
+          # Assemble docker run args based on the configured network mode.
+          run_args=(-d --name ci-validate)
+          if [ "$VALIDATE_NETWORK" = "host" ]; then
+            # Share the runner network so the app can reach service containers on localhost.
+            run_args+=(--network host)
+            base_url="http://localhost:${CONTAINER_PORT}"
+          else
+            run_args+=(-p "${TEST_PORT}:${CONTAINER_PORT}")
+            base_url="http://localhost:${TEST_PORT}"
+          fi
+
+          # Inject any extra env vars (one KEY=VALUE per line).
+          while IFS= read -r line; do
+            [ -z "${line// }" ] && continue
+            run_args+=(-e "$line")
+          done <<< "${VALIDATE_RUN_ENV}"
+
+          docker run "${run_args[@]}" "${{ steps.meta.outputs.ref }}"
 
           case "$VALIDATE" in
             http)
               ok=0
               for i in $(seq 1 15); do
-                code="$(curl -s -o /dev/null -w '%{http_code}' "http://localhost:${TEST_PORT}${HEALTH_PATH}" || true)"
+                code="$(curl -s -o /dev/null -w '%{http_code}' "${base_url}${HEALTH_PATH}" || true)"
                 if [ "$code" = "$EXPECTED_STATUS" ]; then
                   echo "App responded with HTTP $code (expected $EXPECTED_STATUS)."
                   ok=1
