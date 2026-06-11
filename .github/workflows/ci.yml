@@ -1,0 +1,128 @@
+name: CI
+
+# Generic CI workflow — currently covers the TEST phase only.
+# It is designed to be dropped into either a Node/npm project (like this one)
+# or a Java/Gradle project without modification: the project type is detected
+# automatically (or forced via the PROJECT_TYPE variable below), and the right
+# toolchain, dependency cache and test command are selected with conditionals.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# Cancel superseded runs on the same ref to save CI minutes.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+# Least-privilege token. `checks: write` lets the test reporter publish results
+# back into the Actions UI; everything else stays read-only.
+permissions:
+  contents: read
+  checks: write
+
+# ---------------------------------------------------------------------------
+# Tweak these to adapt the workflow to a given project without touching steps.
+# PROJECT_TYPE: 'auto' (detect from files), or force 'node' / 'java'.
+# ---------------------------------------------------------------------------
+env:
+  PROJECT_TYPE: auto
+  NODE_VERSION: '22'
+  JAVA_VERSION: '21'
+  JAVA_DISTRIBUTION: temurin
+
+jobs:
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      # --- Resolve which kind of project this is --------------------------
+      - name: Detect project type
+        id: detect
+        run: |
+          type="${PROJECT_TYPE}"
+          if [ "$type" = "auto" ]; then
+            if [ -f package.json ]; then
+              type=node
+            elif [ -f build.gradle ] || [ -f build.gradle.kts ] || [ -f gradlew ]; then
+              type=java
+            else
+              echo "::error::Could not detect project type. Set the PROJECT_TYPE variable to 'node' or 'java'."
+              exit 1
+            fi
+          fi
+
+          # JUnit report location differs per ecosystem; expose it for the reporter/artifact steps.
+          case "$type" in
+            node) report_path='**/reports/*.xml,**/test-results/**/*.xml' ;;
+            java) report_path='**/build/test-results/test/*.xml' ;;
+            *) echo "::error::Unsupported PROJECT_TYPE '$type'."; exit 1 ;;
+          esac
+
+          echo "type=$type" >> "$GITHUB_OUTPUT"
+          echo "report_path=$report_path" >> "$GITHUB_OUTPUT"
+          echo "Detected project type: $type"
+
+      # --- Node / npm -----------------------------------------------------
+      - name: Set up Node.js
+        if: steps.detect.outputs.type == 'node'
+        uses: actions/setup-node@v6
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm # caches the npm download cache keyed on package-lock.json
+
+      - name: Install dependencies (npm)
+        if: steps.detect.outputs.type == 'node'
+        # Secrets are referenced only through env and never echoed; GitHub also
+        # auto-masks registered secrets in logs. The token is optional — the step
+        # works for public deps when NODE_AUTH_TOKEN is empty.
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: npm ci
+
+      - name: Run tests (npm)
+        if: steps.detect.outputs.type == 'node'
+        run: npm test
+
+      # --- Java / Gradle --------------------------------------------------
+      - name: Set up JDK
+        if: steps.detect.outputs.type == 'java'
+        uses: actions/setup-java@v5
+        with:
+          distribution: ${{ env.JAVA_DISTRIBUTION }}
+          java-version: ${{ env.JAVA_VERSION }}
+          cache: gradle # caches ~/.gradle keyed on the Gradle build files
+
+      - name: Run tests (Gradle)
+        if: steps.detect.outputs.type == 'java'
+        env:
+          GRADLE_TOKEN: ${{ secrets.GRADLE_TOKEN }}
+        run: ./gradlew test --no-daemon
+
+      # --- Test report + artifacts (both ecosystems) ----------------------
+      # Publishes the JUnit results as a check run visible in the Actions UI / PR.
+      - name: Publish test report
+        uses: dorny/test-reporter@v3
+        if: always() # report even when tests fail, so results are still visible
+        with:
+          name: Test results
+          path: ${{ steps.detect.outputs.report_path }}
+          reporter: java-junit # parses standard JUnit XML (npm & Gradle both emit it)
+          fail-on-error: false
+
+      - name: Upload test results artifact
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: test-results
+          path: |
+            reports/
+            test-results/
+            **/build/test-results/
+          if-no-files-found: ignore
+          retention-days: 7
