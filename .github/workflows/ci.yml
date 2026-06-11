@@ -36,6 +36,9 @@ jobs:
   test:
     name: Test
     runs-on: ubuntu-latest
+    # Safety net: abort instead of spinning for the default 6 hours if a test
+    # runner (e.g. headless Chrome) hangs and stops responding.
+    timeout-minutes: 15
 
     steps:
       - name: Checkout
