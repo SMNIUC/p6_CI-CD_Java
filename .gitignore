@@ -2,6 +2,9 @@ HELP.md
 .gradle
 build/
 test-results/
+
+# Local environment variables (secrets) — keep .env.example tracked as a template.
+.env
 !gradle/wrapper/gradle-wrapper.jar
 !**/src/main/**/build/
 !**/src/test/**/build/

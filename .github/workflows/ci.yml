@@ -10,6 +10,8 @@ on:
   push:
     branches: [main]
   pull_request:
+# Releases are cut manually from the Actions tab ("Run workflow").
+  workflow_dispatch:
 
 # Cancel superseded runs on the same ref to save CI minutes.
 concurrency:
@@ -143,7 +145,8 @@ jobs:
     name: Build & push image
     runs-on: ubuntu-latest
     needs: test
-    if: github.event_name == 'push'
+    # Build on branch pushes and on manual release runs (so release has a validated image).
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
     timeout-minutes: 20
 
     # Least-privilege: read the repo, write packages (push to GHCR).
@@ -314,3 +317,113 @@ jobs:
 
       - name: Push image
         run: docker push "${{ steps.meta.outputs.ref }}"
+
+  # ---------------------------------------------------------------------------
+  # Manual release: semantic-release reads the Conventional Commits since the
+  # last tag, decides the next SemVer version, and publishes a GitHub Release
+  # with an auto-generated changelog. The image validated by the build job is
+  # then re-tagged with that version (MAJOR.MINOR.PATCH + rolling tags).
+  #
+  # This job is language-agnostic — semantic-release works off git history and
+  # the image reference convention is identical for every project type, so no
+  # per-language branching is needed (the test/build auto-pick already ran).
+  # ---------------------------------------------------------------------------
+  release:
+    name: Release
+    runs-on: ubuntu-latest
+    needs: build
+    if: github.event_name == 'workflow_dispatch'
+    timeout-minutes: 15
+
+    permissions:
+      contents: write       # create the git tag and the GitHub Release
+      issues: write         # semantic-release comments on resolved issues
+      pull-requests: write  # ...and on released PRs
+      packages: write       # push the versioned image to GHCR
+
+    env:
+      REGISTRY: ghcr.io
+      IMAGE_NAME: ${{ github.repository }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0          # semantic-release needs full history + tags
+          persist-credentials: false
+
+      # Self-contained config so the same workflow file works in any repo.
+      # The explicit plugin list intentionally omits @semantic-release/npm so it
+      # never tries to publish to npm or mutate package.json (matters for the Node app).
+      - name: Write semantic-release config
+        run: |
+          cat > .releaserc.json <<'EOF'
+          {
+            "branches": ["main"],
+            "plugins": [
+              ["@semantic-release/commit-analyzer", { "preset": "conventionalcommits" }],
+              ["@semantic-release/release-notes-generator", { "preset": "conventionalcommits" }],
+              "@semantic-release/github"
+            ]
+          }
+          EOF
+
+      - name: Run semantic-release
+        id: semantic
+        uses: cycjimmy/semantic-release-action@v6
+        with:
+          # The 'conventionalcommits' preset (Conventional Commits spec) is what
+          # understands the `feat!:` / `fix!:` breaking-change shorthand; the default
+          # 'angular' preset does not. This package provides that preset.
+          extra_plugins: |
+            conventional-changelog-conventionalcommits@9
+        env:
+          # Auto-provided token; GitHub masks it in logs. Used to create the tag/release.
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Compute image references
+        if: steps.semantic.outputs.new_release_published == 'true'
+        id: meta
+        run: |
+          image="$(echo "${REGISTRY}/${IMAGE_NAME}" | tr '[:upper:]' '[:lower:]')"
+          branch="$(echo "${GITHUB_REF_NAME}" | tr '/' '-' | tr -cd '[:alnum:]._-')"
+          short_sha="$(echo "${GITHUB_SHA}" | cut -c1-7)"
+          # The exact image the build job validated & pushed for this commit.
+          echo "source=${image}:${branch}-${short_sha}" >> "$GITHUB_OUTPUT"
+          echo "image=${image}" >> "$GITHUB_OUTPUT"
+
+      - name: Log in to GitHub Container Registry
+        if: steps.semantic.outputs.new_release_published == 'true'
+        uses: docker/login-action@v4
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Re-tag the validated commit image with SemVer tags — no rebuild, so we
+      # publish exactly what was tested. e.g. 1.4.0, plus rolling 1.4 / 1 / latest.
+      - name: Tag and push versioned image
+        if: steps.semantic.outputs.new_release_published == 'true'
+        env:
+          SOURCE: ${{ steps.meta.outputs.source }}
+          IMAGE: ${{ steps.meta.outputs.image }}
+          VERSION: ${{ steps.semantic.outputs.new_release_version }}
+          MAJOR: ${{ steps.semantic.outputs.new_release_major_version }}
+          MINOR: ${{ steps.semantic.outputs.new_release_minor_version }}
+        run: |
+          set -euo pipefail
+          docker pull "$SOURCE"
+          for tag in "$VERSION" "${MAJOR}.${MINOR}" "${MAJOR}" latest; do
+            docker tag "$SOURCE" "${IMAGE}:${tag}"
+            docker push "${IMAGE}:${tag}"
+            echo "Pushed ${IMAGE}:${tag}"
+          done
+
+      - name: Release summary
+        if: always()
+        run: |
+          if [ "${{ steps.semantic.outputs.new_release_published }}" = "true" ]; then
+            echo "Released v${{ steps.semantic.outputs.new_release_version }} and pushed SemVer image tags." >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "No release: no Conventional Commits since the last tag warranted a version bump." >> "$GITHUB_STEP_SUMMARY"
+          fi
