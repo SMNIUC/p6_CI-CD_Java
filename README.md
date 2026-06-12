@@ -105,6 +105,24 @@ set -a; source .env; set +a   # export the variables into the current shell
 ./gradlew bootRun
 ```
 
+### Docker Compose credentials
+
+The Docker stack reads its database credentials from the **same `.env` file** —
+Docker Compose automatically loads it from the project directory and substitutes
+the `${...}` references in `docker-compose.yml`. These variables are used by both
+the `db` container (the PostgreSQL it creates) and the `app` container (its
+`SPRING_DATASOURCE_*` connection), so they always stay in sync:
+
+- POSTGRES_USER: database user created in the Postgres container
+- POSTGRES_PASSWORD: password for that user
+- POSTGRES_DB: name of the database to create
+
+They are **separate** from the `SPRING_DATASOURCE_*` values above: those point at a
+PostgreSQL running on your host (for local `./gradlew bootRun`), whereas the
+`POSTGRES_*` values configure the throwaway PostgreSQL that Compose runs in a
+container. Before the first `docker compose up -d` on a fresh clone, create your
+`.env` from the template (`cp .env.example .env`) and adjust the values.
+
 ## Testing
 
 We take testing seriously! To verify the correctness of our application, run the following command:

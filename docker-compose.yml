@@ -10,9 +10,10 @@ services:
     environment:
       # DB connection — points at the "db" service on the compose network,
       # overriding the localhost values from application.properties.
-      SPRING_DATASOURCE_URL: "jdbc:postgresql://db:5432/workshopsdb"
-      SPRING_DATASOURCE_USERNAME: workshops_user
-      SPRING_DATASOURCE_PASSWORD: oc2024
+      # Credentials are read from the .env file (same vars as the db service).
+      SPRING_DATASOURCE_URL: "jdbc:postgresql://db:5432/${POSTGRES_DB}"
+      SPRING_DATASOURCE_USERNAME: ${POSTGRES_USER}
+      SPRING_DATASOURCE_PASSWORD: ${POSTGRES_PASSWORD}
     depends_on:
       db:
         # Don't start the app until Postgres reports healthy.
@@ -29,14 +30,15 @@ services:
   db:
     image: postgres:13
     environment:
-      POSTGRES_USER: workshops_user
-      POSTGRES_PASSWORD: oc2024
-      POSTGRES_DB: workshopsdb
+      # Credentials are read from the .env file (see .env.example).
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
     volumes:
       # Named volume so data survives container restarts / recreation.
       - postgres_data:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U workshops_user -d workshopsdb"]
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
       interval: 10s
       timeout: 5s
       retries: 5

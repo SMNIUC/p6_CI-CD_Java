@@ -3,12 +3,11 @@ plugins {
 	id 'org.springframework.boot' version '3.2.4'
 	id 'io.spring.dependency-management' version '1.1.4'
 	id 'java'
-	id 'maven-publish'
 	id 'war'
 }
 
 group = 'fr.oc.devops'
-version = '0.2.4'
+version = '1.0.1'
 
 repositories {
 	mavenCentral()
@@ -74,25 +73,4 @@ test {
 
 war {
     enabled = false
-}
-
-publishing {
-    publications {
-		MavenPublication(MavenPublication) {
-			artifact bootWar
-		}
-    }
-    repositories {
-		maven {
-			url "https://gitlab.com/api/v4/projects/$System.env.GITLAB_PROJECT_ID/packages/maven"
-			name "GitLab"
-			credentials(HttpHeaderCredentials) {
-				name = System.getenv("GITLAB_TOKEN_NAME")
-				value = System.getenv("GITLAB_TOKEN")
-			}
-			authentication {
-				header(HttpHeaderAuthentication)
-			}
-		}
-    }
 }
